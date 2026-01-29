@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, StreamingResponse
 from starlette.status import HTTP_404_NOT_FOUND
 from sqlalchemy import desc, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -440,41 +440,57 @@ def stream_song(song_id: uuid.UUID, request: Request):
         logger.warning("stream_song_empty_file: song_id=%s path=%s", str(song_id), str(media_path))
         _json_404("File missing on server.")
 
-    # For robust production streaming (and proper 200/206 behavior under proxies),
-    # prefer Starlette's FileResponse which implements HTTP Range natively.
+    # Prefer Starlette's FileResponse which implements HTTP Range natively.
     #
-    # Note: We still compute file_size above so we can validate empties and emit JSON 404.
-    headers = {
-        "Accept-Ranges": "bytes",
-        # Inline disposition to support <audio> playback without forced download.
-        # Keep filename ASCII-safe.
-        "Content-Disposition": f'inline; filename="{_sanitize_filename(song.title)}.mp3"',
-    }
+    # Important: do NOT override Accept-Ranges/Content-Range headers ourselves.
+    # Some Starlette versions/proxy setups can error if these are set manually while
+    # FileResponse is also performing range negotiation.
+    disposition_name = f"{_sanitize_filename(song.title)}.mp3"
 
     try:
         return FileResponse(
             path=str(media_path),
             media_type="audio/mpeg",
-            filename=f"{_sanitize_filename(song.title)}.mp3",
-            headers=headers,
+            filename=disposition_name,
+            # Force inline playback in browsers.
+            content_disposition_type="inline",
         )
     except FileNotFoundError:
-        # Extremely defensive: even though we checked is_file(), race conditions can happen.
         _json_404("File missing on server.")
-    except OSError as exc:
+    except Exception as exc:
+        # Fallback: manual (single-range) streaming response.
+        # This guarantees correct behavior even if FileResponse fails under a specific runtime/proxy.
         logger.exception(
-            "stream_song_fileresponse_failed: song_id=%s path=%s size=%s range=%s exc=%s",
+            "stream_song_fileresponse_failed_fallback_to_streaming: song_id=%s path=%s size=%s range=%s exc=%s",
             str(song_id),
             str(media_path),
             file_size,
             range_header,
             exc.__class__.__name__,
         )
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "stream_read_failed",
-                "message": "Failed to read media file for streaming.",
-                "path": str(media_path),
-            },
+
+        byte_range = _parse_range_header(range_header or "", file_size)
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{disposition_name}"',
+        }
+
+        if byte_range:
+            start, end = byte_range
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            content_length = end - start + 1
+            headers["Content-Length"] = str(content_length)
+            return StreamingResponse(
+                _iter_file_range(media_path, start, end),
+                status_code=206,
+                media_type="audio/mpeg",
+                headers=headers,
+            )
+
+        headers["Content-Length"] = str(file_size)
+        return StreamingResponse(
+            _iter_file_range(media_path, 0, file_size - 1),
+            status_code=200,
+            media_type="audio/mpeg",
+            headers=headers,
         )
