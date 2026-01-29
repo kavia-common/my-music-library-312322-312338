@@ -10,6 +10,7 @@ public to keep upload, list, and playback flows working without tokens.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import uuid
@@ -28,14 +29,39 @@ from src.api.db import db_session_dep, get_db_session
 from src.api.models import Song
 from src.api.schemas import SongResponse, SongUploadResponse
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["Songs"])
 
 _MAX_FILE_BYTES_DEFAULT = 50 * 1024 * 1024  # 50MB
 
+# Anchor paths to the backend container root (music_player_backend/), not the process CWD.
+# This prevents preview/runtime working-directory differences from breaking streaming.
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _media_root() -> Path:
-    # Default to container-local media directory. Override via env if desired.
-    return Path(os.getenv("MEDIA_ROOT", "media")).resolve()
+    """
+    Return the absolute directory where media files are stored.
+
+    Resolution strategy:
+    - If MEDIA_ROOT is an absolute path: use it.
+    - If MEDIA_ROOT is relative or unset: resolve it relative to the backend container root.
+
+    This is intentionally *not* based on the current working directory because the live
+    preview runtime can start uvicorn from a different CWD than local dev/tests.
+    """
+    configured = os.getenv("MEDIA_ROOT", "media").strip() or "media"
+    raw = Path(configured)
+
+    if raw.is_absolute():
+        root = raw
+    else:
+        root = (_BACKEND_ROOT / raw)
+
+    # resolve() normalizes but we keep the anchor above stable.
+    resolved = root.resolve()
+    return resolved
 
 
 def _json_404(detail: str) -> None:
@@ -249,7 +275,18 @@ def stream_song(song_id: uuid.UUID):
             ),
         )
 
+    media_root = _media_root()
     media_path = _resolve_song_media_path(song.filename)
+
+    # Diagnostic breadcrumbs for preview-only failures.
+    logger.info(
+        "stream_song: song_id=%s filename=%s media_root=%s resolved_path=%s cwd=%s",
+        str(song_id),
+        song.filename,
+        str(media_root),
+        str(media_path),
+        os.getcwd(),
+    )
 
     # Use is_file() (not exists()) so we don't serve directories, and we return JSON 404 if missing.
     if not media_path.is_file():
@@ -258,7 +295,6 @@ def stream_song(song_id: uuid.UUID):
     # FileResponse supports range requests in Starlette for efficient streaming.
     try:
         # Use positional path arg for maximum compatibility across Starlette/FastAPI versions.
-        # Some runtimes have shown 500s when using the keyword arg form.
         safe_download_name = _sanitize_filename(f"{song.title}.mp3")
         return FileResponse(
             str(media_path),
@@ -266,5 +302,20 @@ def stream_song(song_id: uuid.UUID):
             filename=safe_download_name,
         )
     except OSError:
-        # If the path exists but cannot be opened/read, treat as missing from an API perspective.
+        # Path exists but cannot be opened/read: treat as missing from API perspective.
         _json_404("File missing on server.")
+    except Exception as exc:
+        # Ensure we never leak an opaque text/plain 500 for this endpoint.
+        logger.exception(
+            "stream_song: unexpected error building FileResponse (song_id=%s path=%s)",
+            str(song_id),
+            str(media_path),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "stream_failed",
+                "message": "Failed to stream file due to an unexpected server error.",
+                "exception": exc.__class__.__name__,
+            },
+        )
