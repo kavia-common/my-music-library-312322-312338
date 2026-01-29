@@ -16,10 +16,10 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from starlette.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from starlette.responses import StreamingResponse
 from starlette.status import HTTP_404_NOT_FOUND
 from sqlalchemy import desc, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -150,6 +150,76 @@ def _validate_mp3(upload: UploadFile, content: bytes) -> Tuple[str, int]:
     return safe_name, len(content)
 
 
+def _parse_range_header(range_header: str, file_size: int) -> Optional[Tuple[int, int]]:
+    """
+    Parse a single HTTP Range header ("bytes=start-end") for a file.
+
+    Returns:
+        (start, end) inclusive byte offsets if valid, else None.
+    """
+    if not range_header:
+        return None
+
+    # Example: "bytes=0-1023" or "bytes=100-" or "bytes=-500"
+    if not range_header.startswith("bytes="):
+        return None
+
+    spec = range_header[len("bytes=") :].strip()
+    # We only support a single range (no commas).
+    if "," in spec:
+        return None
+
+    start_s, end_s = (spec.split("-", 1) + [""])[:2]
+    start_s = start_s.strip()
+    end_s = end_s.strip()
+
+    try:
+        if start_s == "" and end_s == "":
+            return None
+
+        if start_s == "":
+            # suffix range: last N bytes
+            suffix_len = int(end_s)
+            if suffix_len <= 0:
+                return None
+            start = max(file_size - suffix_len, 0)
+            end = file_size - 1
+            return (start, end)
+
+        start = int(start_s)
+        if start < 0:
+            return None
+
+        if end_s == "":
+            end = file_size - 1
+        else:
+            end = int(end_s)
+
+        if end < start:
+            return None
+        if start >= file_size:
+            return None
+
+        end = min(end, file_size - 1)
+        return (start, end)
+    except ValueError:
+        return None
+
+
+def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
+    """Yield bytes from file [start, end] inclusive."""
+    with path.open("rb") as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            to_read = min(chunk_size, remaining)
+            chunk = f.read(to_read)
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
 @router.get(
     "/songs",
     response_model=List[SongResponse],
@@ -248,22 +318,22 @@ def upload_song(
 @router.get(
     "/songs/{song_id}/stream",
     summary="Stream a song",
-    description="Streams the mp3 file (public).",
+    description="Streams the mp3 file (public). Supports HTTP Range requests.",
     operation_id="stream_song",
     responses={
         200: {"content": {"audio/mpeg": {}}},
+        206: {"content": {"audio/mpeg": {}}},
         404: {"description": "Not found"},
     },
 )
-def stream_song(song_id: uuid.UUID):
-    """Serve a song file by id (public)."""
+def stream_song(song_id: uuid.UUID, request: Request):
+    """Serve a song file by id (public), with explicit Range support."""
     try:
         with get_db_session() as db:
             song = db.execute(select(Song).where(Song.id == song_id)).scalar_one_or_none()
             if not song:
                 _json_404("Song not found.")
     except HTTPException:
-        # Preserve explicit HTTP errors (404 etc).
         raise
     except (RuntimeError, SQLAlchemyError) as exc:
         raise HTTPException(
@@ -278,44 +348,55 @@ def stream_song(song_id: uuid.UUID):
     media_root = _media_root()
     media_path = _resolve_song_media_path(song.filename)
 
-    # Diagnostic breadcrumbs for preview-only failures.
     logger.info(
-        "stream_song: song_id=%s filename=%s media_root=%s resolved_path=%s cwd=%s",
+        "stream_song: song_id=%s filename=%s media_root=%s resolved_path=%s cwd=%s range=%s",
         str(song_id),
         song.filename,
         str(media_root),
         str(media_path),
         os.getcwd(),
+        request.headers.get("range"),
     )
 
-    # Use is_file() (not exists()) so we don't serve directories, and we return JSON 404 if missing.
     if not media_path.is_file():
         _json_404("File missing on server.")
 
-    # FileResponse supports range requests in Starlette for efficient streaming.
     try:
-        # Use positional path arg for maximum compatibility across Starlette/FastAPI versions.
-        safe_download_name = _sanitize_filename(f"{song.title}.mp3")
-        return FileResponse(
-            str(media_path),
-            media_type="audio/mpeg",
-            filename=safe_download_name,
-        )
+        file_size = media_path.stat().st_size
     except OSError:
-        # Path exists but cannot be opened/read: treat as missing from API perspective.
         _json_404("File missing on server.")
-    except Exception as exc:
-        # Ensure we never leak an opaque text/plain 500 for this endpoint.
-        logger.exception(
-            "stream_song: unexpected error building FileResponse (song_id=%s path=%s)",
-            str(song_id),
-            str(media_path),
+
+    range_header = request.headers.get("range") or request.headers.get("Range")
+    byte_range = _parse_range_header(range_header, file_size) if range_header else None
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        # Inline disposition to support <audio> playback without forced download.
+        # Keep filename ASCII-safe.
+        "Content-Disposition": f'inline; filename="{_sanitize_filename(song.title)}.mp3"',
+    }
+
+    if byte_range is None:
+        # Full content
+        headers["Content-Length"] = str(file_size)
+        return StreamingResponse(
+            _iter_file_range(media_path, 0, file_size - 1),
+            media_type="audio/mpeg",
+            headers=headers,
+            status_code=200,
         )
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "stream_failed",
-                "message": "Failed to stream file due to an unexpected server error.",
-                "exception": exc.__class__.__name__,
-            },
-        )
+
+    start, end = byte_range
+    content_length = end - start + 1
+    headers.update(
+        {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(content_length),
+        }
+    )
+    return StreamingResponse(
+        _iter_file_range(media_path, start, end),
+        media_type="audio/mpeg",
+        headers=headers,
+        status_code=206,
+    )
