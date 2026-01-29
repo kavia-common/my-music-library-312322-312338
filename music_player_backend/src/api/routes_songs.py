@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from starlette.responses import StreamingResponse
+from starlette.responses import FileResponse
 from starlette.status import HTTP_404_NOT_FOUND
 from sqlalchemy import desc, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -440,8 +440,10 @@ def stream_song(song_id: uuid.UUID, request: Request):
         logger.warning("stream_song_empty_file: song_id=%s path=%s", str(song_id), str(media_path))
         _json_404("File missing on server.")
 
-    byte_range = _parse_range_header(range_header, file_size) if range_header else None
-
+    # For robust production streaming (and proper 200/206 behavior under proxies),
+    # prefer Starlette's FileResponse which implements HTTP Range natively.
+    #
+    # Note: We still compute file_size above so we can validate empties and emit JSON 404.
     headers = {
         "Accept-Ranges": "bytes",
         # Inline disposition to support <audio> playback without forced download.
@@ -450,34 +452,18 @@ def stream_song(song_id: uuid.UUID, request: Request):
     }
 
     try:
-        if byte_range is None:
-            # Full content
-            headers["Content-Length"] = str(file_size)
-            return StreamingResponse(
-                _iter_file_range(media_path, 0, file_size - 1),
-                media_type="audio/mpeg",
-                headers=headers,
-                status_code=200,
-            )
-
-        start, end = byte_range
-        content_length = end - start + 1
-        headers.update(
-            {
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Content-Length": str(content_length),
-            }
-        )
-        return StreamingResponse(
-            _iter_file_range(media_path, start, end),
+        return FileResponse(
+            path=str(media_path),
             media_type="audio/mpeg",
+            filename=f"{_sanitize_filename(song.title)}.mp3",
             headers=headers,
-            status_code=206,
         )
+    except FileNotFoundError:
+        # Extremely defensive: even though we checked is_file(), race conditions can happen.
+        _json_404("File missing on server.")
     except OSError as exc:
-        # Covers file open/seek/read errors (permissions, transient FS issues, etc.)
         logger.exception(
-            "stream_song_read_failed: song_id=%s path=%s size=%s range=%s exc=%s",
+            "stream_song_fileresponse_failed: song_id=%s path=%s size=%s range=%s exc=%s",
             str(song_id),
             str(media_path),
             file_size,
