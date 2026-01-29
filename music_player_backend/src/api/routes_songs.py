@@ -257,11 +257,13 @@ def stream_song(song_id: uuid.UUID):
 
     # FileResponse supports range requests in Starlette for efficient streaming.
     try:
-        # Serve as audio/mpeg for reliable browser playback in preview environments.
+        # Use positional path arg for maximum compatibility across Starlette/FastAPI versions.
+        # Some runtimes have shown 500s when using the keyword arg form.
+        safe_download_name = _sanitize_filename(f"{song.title}.mp3")
         return FileResponse(
-            path=str(media_path),
+            str(media_path),
             media_type="audio/mpeg",
-            filename=f"{song.title}.mp3",
+            filename=safe_download_name,
         )
     except OSError:
         # If the path exists but cannot be opened/read, treat as missing from an API perspective.
