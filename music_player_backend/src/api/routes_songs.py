@@ -1,8 +1,11 @@
 """
-Song endpoints:
+Song endpoints (public):
 - POST /songs/upload (multipart mp3 upload)
-- GET /songs (list current user's songs)
-- GET /songs/{id}/stream (secure streaming for current user only)
+- GET /songs (list all songs)
+- GET /songs/{id}/stream (public streaming)
+
+Authentication has been removed from the backend; these endpoints are intentionally
+public to keep upload, list, and playback flows working without tokens.
 """
 
 from __future__ import annotations
@@ -14,13 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy import select, desc
+from sqlalchemy import desc, select
 
-from src.api.auth import get_current_user
 from src.api.db import get_db_session
-from src.api.models import Song, User
+from src.api.models import Song
 from src.api.schemas import SongResponse, SongUploadResponse
 
 router = APIRouter(tags=["Songs"])
@@ -84,22 +86,14 @@ def _validate_mp3(upload: UploadFile, content: bytes) -> Tuple[str, int]:
 @router.get(
     "/songs",
     response_model=List[SongResponse],
-    summary="List current user's songs",
-    description="Returns songs for the authenticated user, newest first.",
+    summary="List all songs",
+    description="Returns all songs in the library, newest first.",
     operation_id="list_songs",
 )
-def list_songs(current_user: User = Depends(get_current_user)) -> List[SongResponse]:
-    """List songs belonging to the current user."""
+def list_songs() -> List[SongResponse]:
+    """List all songs in the library (public)."""
     with get_db_session() as db:
-        songs = (
-            db.execute(
-                select(Song)
-                .where(Song.user_id == current_user.id)
-                .order_by(desc(Song.created_at))
-            )
-            .scalars()
-            .all()
-        )
+        songs = db.execute(select(Song).order_by(desc(Song.created_at))).scalars().all()
         return [
             SongResponse(
                 id=s.id,
@@ -117,16 +111,15 @@ def list_songs(current_user: User = Depends(get_current_user)) -> List[SongRespo
     "/songs/upload",
     response_model=SongUploadResponse,
     summary="Upload an mp3",
-    description="Uploads an mp3 file for the authenticated user. Stores file on disk and metadata in DB.",
+    description="Uploads an mp3 file. Stores file on disk and metadata in DB.",
     operation_id="upload_song",
 )
 def upload_song(
     file: UploadFile = File(..., description="MP3 file upload (multipart/form-data)"),
     title: Optional[str] = Form(None, description="Optional title. Defaults to original filename stem."),
     artist: Optional[str] = Form(None, description="Optional artist. Defaults to 'Unknown Artist'."),
-    current_user: User = Depends(get_current_user),
 ) -> SongUploadResponse:
-    """Upload an mp3 for the current user with basic validation and metadata."""
+    """Upload an mp3 with basic validation and metadata (public)."""
     content = file.file.read()
     safe_name, size_bytes = _validate_mp3(file, content)
 
@@ -153,7 +146,7 @@ def upload_song(
     with get_db_session() as db:
         song = Song(
             id=song_id,
-            user_id=current_user.id,
+            user_id=None,  # auth removed; songs are not user-scoped anymore
             title=final_title,
             artist=final_artist,
             filename=stored_filename,
@@ -178,24 +171,18 @@ def upload_song(
 
 @router.get(
     "/songs/{song_id}/stream",
-    summary="Stream a song (secure)",
-    description="Streams the mp3 file for the authenticated user if they own it.",
+    summary="Stream a song",
+    description="Streams the mp3 file (public).",
     operation_id="stream_song",
     responses={
         200: {"content": {"audio/mpeg": {}}},
-        401: {"description": "Unauthorized"},
         404: {"description": "Not found"},
     },
 )
-def stream_song(song_id: uuid.UUID, current_user: User = Depends(get_current_user)):
-    """Securely serve a song file only if it belongs to the current user."""
+def stream_song(song_id: uuid.UUID):
+    """Serve a song file by id (public)."""
     with get_db_session() as db:
-        song = (
-            db.execute(
-                select(Song).where(Song.id == song_id, Song.user_id == current_user.id)
-            )
-            .scalar_one_or_none()
-        )
+        song = db.execute(select(Song).where(Song.id == song_id)).scalar_one_or_none()
         if not song:
             raise HTTPException(status_code=404, detail="Song not found.")
 

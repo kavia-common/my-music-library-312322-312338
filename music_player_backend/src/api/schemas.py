@@ -8,22 +8,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field, EmailStr
-
-
-class AuthRegisterRequest(BaseModel):
-    email: EmailStr = Field(..., description="User email address (unique).")
-    password: str = Field(..., min_length=6, description="User password (min 6 chars).")
-
-
-class AuthLoginRequest(BaseModel):
-    email: EmailStr = Field(..., description="User email address.")
-    password: str = Field(..., description="User password.")
-
-
-class AuthTokenResponse(BaseModel):
-    token: str = Field(..., description="JWT access token.")
-    token_type: str = Field("bearer", description="Token type for Authorization header.")
+from pydantic import BaseModel, Field
 
 
 class SongResponse(BaseModel):

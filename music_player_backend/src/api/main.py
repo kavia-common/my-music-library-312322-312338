@@ -1,25 +1,38 @@
+"""
+FastAPI application entrypoint for the Music Player backend.
+
+This backend is intentionally PUBLIC (no authentication):
+- POST /songs/upload
+- GET /songs
+- GET /songs/{song_id}/stream
+
+CORS is enabled for local development (http://localhost:3000) and can be extended
+via environment variables.
+"""
+
+from __future__ import annotations
+
+import os as _os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api.routes_auth import router as auth_router
 from src.api.routes_songs import router as songs_router
 
 openapi_tags = [
-    {"name": "Auth", "description": "User registration and login (JWT)."},
-    {"name": "Songs", "description": "Upload, list, and stream user-owned mp3 files."},
+    {"name": "Songs", "description": "Upload, list, and stream mp3 files (public)."},
+    {"name": "Health", "description": "Service health and basic runtime info."},
 ]
 
 app = FastAPI(
     title="Music Player Backend API",
     description=(
         "Backend for a personal music library.\n\n"
-        "Authentication:\n"
-        "- Obtain a token via POST /auth/login (or /auth/register)\n"
-        "- Send it on subsequent requests: Authorization: Bearer <token>\n\n"
+        "Authentication: none (public API)\n\n"
         "Streaming:\n"
-        "- GET /songs/{song_id}/stream requires Authorization header and only serves owned songs."
+        "- GET /songs/{song_id}/stream is public and supports range requests for efficient playback."
     ),
-    version="1.0.0",
+    version="2.0.0",
     openapi_tags=openapi_tags,
 )
 
@@ -32,7 +45,6 @@ cors_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
-import os as _os
 
 _allow_origins_raw = _os.getenv("CORS_ALLOW_ORIGINS") or _os.getenv("ALLOWED_ORIGINS", "")
 extra_origins = [o.strip() for o in _allow_origins_raw.split(",") if o.strip()]
@@ -46,7 +58,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_router)
 app.include_router(songs_router)
 
 
@@ -54,7 +65,8 @@ app.include_router(songs_router)
     "/",
     summary="Health check",
     description="Simple health check endpoint.",
-    tags=["Auth"],
+    tags=["Health"],
 )
 def health_check():
-    return {"message": "Healthy"}
+    """Return basic service health information."""
+    return {"status": "ok"}
