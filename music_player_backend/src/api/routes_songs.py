@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from starlette.responses import FileResponse, StreamingResponse
+from starlette.responses import StreamingResponse
 from starlette.status import HTTP_404_NOT_FOUND
 from sqlalchemy import desc, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -440,57 +440,37 @@ def stream_song(song_id: uuid.UUID, request: Request):
         logger.warning("stream_song_empty_file: song_id=%s path=%s", str(song_id), str(media_path))
         _json_404("File missing on server.")
 
-    # Prefer Starlette's FileResponse which implements HTTP Range natively.
+    # Serve via manual StreamingResponse (single-range support).
     #
-    # Important: do NOT override Accept-Ranges/Content-Range headers ourselves.
-    # Some Starlette versions/proxy setups can error if these are set manually while
-    # FileResponse is also performing range negotiation.
+    # Why not FileResponse?
+    # In some live-preview/proxy environments FileResponse can fail during the streaming
+    # phase (after the route returns), resulting in generic `500 text/plain` responses
+    # that bypass our normal error handling. Manual streaming is predictable and keeps
+    # 200/206/404 behavior under our control.
     disposition_name = f"{_sanitize_filename(song.title)}.mp3"
 
-    try:
-        return FileResponse(
-            path=str(media_path),
-            media_type="audio/mpeg",
-            filename=disposition_name,
-            # Force inline playback in browsers.
-            content_disposition_type="inline",
-        )
-    except FileNotFoundError:
-        _json_404("File missing on server.")
-    except Exception as exc:
-        # Fallback: manual (single-range) streaming response.
-        # This guarantees correct behavior even if FileResponse fails under a specific runtime/proxy.
-        logger.exception(
-            "stream_song_fileresponse_failed_fallback_to_streaming: song_id=%s path=%s size=%s range=%s exc=%s",
-            str(song_id),
-            str(media_path),
-            file_size,
-            range_header,
-            exc.__class__.__name__,
-        )
+    byte_range = _parse_range_header(range_header or "", file_size)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'inline; filename="{disposition_name}"',
+    }
 
-        byte_range = _parse_range_header(range_header or "", file_size)
-        headers = {
-            "Accept-Ranges": "bytes",
-            "Content-Disposition": f'inline; filename="{disposition_name}"',
-        }
-
-        if byte_range:
-            start, end = byte_range
-            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            content_length = end - start + 1
-            headers["Content-Length"] = str(content_length)
-            return StreamingResponse(
-                _iter_file_range(media_path, start, end),
-                status_code=206,
-                media_type="audio/mpeg",
-                headers=headers,
-            )
-
-        headers["Content-Length"] = str(file_size)
+    if byte_range:
+        start, end = byte_range
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        content_length = end - start + 1
+        headers["Content-Length"] = str(content_length)
         return StreamingResponse(
-            _iter_file_range(media_path, 0, file_size - 1),
-            status_code=200,
+            _iter_file_range(media_path, start, end),
+            status_code=206,
             media_type="audio/mpeg",
             headers=headers,
         )
+
+    headers["Content-Length"] = str(file_size)
+    return StreamingResponse(
+        _iter_file_range(media_path, 0, file_size - 1),
+        status_code=200,
+        media_type="audio/mpeg",
+        headers=headers,
+    )
