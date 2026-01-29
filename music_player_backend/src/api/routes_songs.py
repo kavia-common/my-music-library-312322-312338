@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from starlette.responses import StreamingResponse
+from starlette.responses import FileResponse, JSONResponse
 from starlette.status import HTTP_404_NOT_FOUND
 from sqlalchemy import desc, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -362,7 +362,13 @@ def upload_song(
     },
 )
 def stream_song(song_id: uuid.UUID, request: Request):
-    """Serve a song file by id (public), with explicit Range support."""
+    """
+    Serve a song file by id (public).
+
+    Behavior guarantees (important for live preview):
+    - If song id does not exist OR the file is missing/unreadable: return JSON 404.
+    - Otherwise: return an audio/mpeg response supporting Range (200/206).
+    """
     try:
         with get_db_session() as db:
             song = db.execute(select(Song).where(Song.id == song_id)).scalar_one_or_none()
@@ -381,18 +387,14 @@ def stream_song(song_id: uuid.UUID, request: Request):
         )
 
     media_root = _media_root()
-
-    # Range header can be any casing depending on proxy.
     range_header = request.headers.get("range") or request.headers.get("Range")
 
     # Resolve path with fallback and log *before* attempting to read.
     try:
         media_path = _resolve_song_media_path(song.filename)
     except HTTPException:
-        # keep JSON 404 shape from helpers
         raise
     except Exception as exc:
-        # Extremely defensive: never allow path resolution to bubble up as plain-text 500.
         logger.exception(
             "stream_song_path_resolution_error: song_id=%s filename=%r media_root=%s cwd=%s exc=%s",
             str(song_id),
@@ -406,71 +408,114 @@ def stream_song(song_id: uuid.UUID, request: Request):
             detail={"error": "stream_setup_failed", "message": "Failed to resolve media path."},
         )
 
-    exists = media_path.exists()
-    is_file = media_path.is_file()
-
     logger.info(
         "stream_song: song_id=%s filename=%s media_root=%s resolved_path=%s exists=%s is_file=%s cwd=%s range=%s",
         str(song_id),
         song.filename,
         str(media_root),
         str(media_path),
-        exists,
-        is_file,
+        media_path.exists(),
+        media_path.is_file(),
         os.getcwd(),
         range_header,
     )
 
-    if not is_file:
+    if not media_path.is_file():
         _json_404("File missing on server.")
 
+    # Critical: open the file *before* returning a response, so we can convert any
+    # access errors into JSON 404 instead of a late streaming failure (500 text/plain).
     try:
-        file_size = media_path.stat().st_size
+        with media_path.open("rb") as f:
+            head = f.read(1)
+            if head == b"":
+                _json_404("File missing on server.")
+    except HTTPException:
+        raise
     except OSError as exc:
         logger.warning(
-            "stream_song_stat_failed: song_id=%s path=%s exc=%s",
+            "stream_song_open_failed: song_id=%s path=%s exc=%s",
             str(song_id),
             str(media_path),
             exc.__class__.__name__,
         )
         _json_404("File missing on server.")
 
-    # If file is empty, treat as missing/corrupt rather than streaming.
-    if file_size <= 0:
-        logger.warning("stream_song_empty_file: song_id=%s path=%s", str(song_id), str(media_path))
-        _json_404("File missing on server.")
-
-    # Serve via manual StreamingResponse (single-range support).
-    #
-    # Why not FileResponse?
-    # In some live-preview/proxy environments FileResponse can fail during the streaming
-    # phase (after the route returns), resulting in generic `500 text/plain` responses
-    # that bypass our normal error handling. Manual streaming is predictable and keeps
-    # 200/206/404 behavior under our control.
     disposition_name = f"{_sanitize_filename(song.title)}.mp3"
-
-    byte_range = _parse_range_header(range_header or "", file_size)
     headers = {
+        # Explicitly advertise range support (FileResponse also supports it).
         "Accept-Ranges": "bytes",
         "Content-Disposition": f'inline; filename="{disposition_name}"',
     }
 
-    if byte_range:
-        start, end = byte_range
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        content_length = end - start + 1
-        headers["Content-Length"] = str(content_length)
-        return StreamingResponse(
-            _iter_file_range(media_path, start, end),
-            status_code=206,
-            media_type="audio/mpeg",
-            headers=headers,
+    # FileResponse supports range requests and will return 206 when appropriate.
+    # We force the content-type to audio/mpeg to match the contract.
+    return FileResponse(
+        path=str(media_path),
+        media_type="audio/mpeg",
+        filename=disposition_name,
+        headers=headers,
+    )
+
+
+@router.get(
+    "/songs/{song_id}/stream/debug",
+    summary="Debug stream resolution",
+    description="Returns resolved media path info for the given song id (no file bytes). Useful for live preview debugging.",
+    operation_id="stream_song_debug",
+    tags=["Songs"],
+    responses={404: {"description": "Not found"}},
+)
+def stream_song_debug(song_id: uuid.UUID):
+    """
+    Debug endpoint to help diagnose live-preview path/access issues.
+
+    Returns JSON describing the song filename and resolved path (without streaming bytes).
+    """
+    try:
+        with get_db_session() as db:
+            song = db.execute(select(Song).where(Song.id == song_id)).scalar_one_or_none()
+            if not song:
+                _json_404("Song not found.")
+    except HTTPException:
+        raise
+    except (RuntimeError, SQLAlchemyError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Backend database error while loading song metadata. "
+                "Verify DATABASE_URL or POSTGRES_* env vars are configured for the backend. "
+                f"({exc.__class__.__name__})"
+            ),
         )
 
-    headers["Content-Length"] = str(file_size)
-    return StreamingResponse(
-        _iter_file_range(media_path, 0, file_size - 1),
-        status_code=200,
-        media_type="audio/mpeg",
-        headers=headers,
+    media_root = _media_root()
+    try:
+        media_path = _resolve_song_media_path(song.filename)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "stream_song_debug_path_resolution_error: song_id=%s filename=%r media_root=%s cwd=%s exc=%s",
+            str(song_id),
+            song.filename,
+            str(media_root),
+            os.getcwd(),
+            exc.__class__.__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "stream_setup_failed", "message": "Failed to resolve media path."},
+        )
+
+    return JSONResponse(
+        {
+            "song_id": str(song_id),
+            "db_filename": song.filename,
+            "media_root": str(media_root),
+            "resolved_path": str(media_path),
+            "exists": media_path.exists(),
+            "is_file": media_path.is_file(),
+            "cwd": os.getcwd(),
+        }
     )
