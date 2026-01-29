@@ -84,8 +84,8 @@ def _resolve_song_media_path(song_filename: str) -> Path:
     Live-preview hardening:
     - If the file is not found under MEDIA_ROOT, also try a small set of fallback
       locations under the backend root. This covers cases where the runtime CWD or
-      deployment layout differs from local expectations (e.g. MEDIA_ROOT was resolved
-      differently at upload vs stream time).
+      deployment layout differs from local expectations (e.g. MEDIA_ROOT was resolved differently
+      at upload vs stream time).
     """
     if not song_filename:
         _json_404("File missing on server.")
@@ -125,7 +125,8 @@ def _resolve_song_media_path(song_filename: str) -> Path:
             continue
         if fb.is_file():
             logger.warning(
-                "media_path_fallback_hit: stored_filename=%s resolved_to=%s (media_root=%s backend_root=%s)",
+                "media_path_fallback_hit: stored_filename=%s resolved_to=%s "
+                "(media_root=%s backend_root=%s)",
                 song_filename,
                 str(fb),
                 str(media_root),
@@ -167,7 +168,9 @@ def _validate_mp3(upload: UploadFile, content: bytes) -> Tuple[str, int]:
         raise HTTPException(status_code=400, detail="Only .mp3 files are supported.")
 
     content_type = (upload.content_type or "").lower()
-    if content_type and ("audio/mpeg" not in content_type) and ("application/octet-stream" not in content_type):
+    if content_type and ("audio/mpeg" not in content_type) and (
+        "application/octet-stream" not in content_type
+    ):
         raise HTTPException(status_code=400, detail="Invalid content type; expected audio/mpeg.")
 
     if len(content) == 0:
@@ -241,7 +244,9 @@ def _parse_range_header(range_header: str, file_size: int) -> Optional[Tuple[int
         return None
 
 
-def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
+def _iter_file_range(
+    path: Path, start: int, end: int, chunk_size: int = 1024 * 1024
+) -> Iterator[bytes]:
     """Yield bytes from file [start, end] inclusive."""
     with path.open("rb") as f:
         f.seek(start)
@@ -287,8 +292,12 @@ def list_songs(db: Session = Depends(db_session_dep)) -> List[SongResponse]:
 )
 def upload_song(
     file: UploadFile = File(..., description="MP3 file upload (multipart/form-data)"),
-    title: Optional[str] = Form(None, description="Optional title. Defaults to original filename stem."),
-    artist: Optional[str] = Form(None, description="Optional artist. Defaults to 'Unknown Artist'."),
+    title: Optional[str] = Form(
+        None, description="Optional title. Defaults to original filename stem."
+    ),
+    artist: Optional[str] = Form(
+        None, description="Optional artist. Defaults to 'Unknown Artist'."
+    ),
 ) -> SongUploadResponse:
     """Upload an mp3 with basic validation and metadata (public)."""
     content = file.file.read()
@@ -369,11 +378,19 @@ def stream_song(song_id: uuid.UUID, request: Request):
     - If song id does not exist OR the file is missing/unreadable: return JSON 404.
     - Otherwise: return an audio/mpeg response supporting Range (200/206).
     """
+    # IMPORTANT:
+    # SQLAlchemy expires ORM attributes on commit by default. Since `get_db_session()`
+    # commits/closes at the end of the context manager, *do not* access ORM attributes
+    # outside that block, or you can hit DetachedInstanceError (500 text/plain).
     try:
         with get_db_session() as db:
             song = db.execute(select(Song).where(Song.id == song_id)).scalar_one_or_none()
             if not song:
                 _json_404("Song not found.")
+
+            # Extract everything we need while the session is still active.
+            song_filename = str(song.filename)
+            song_title = str(song.title)
     except HTTPException:
         raise
     except (RuntimeError, SQLAlchemyError) as exc:
@@ -391,14 +408,14 @@ def stream_song(song_id: uuid.UUID, request: Request):
 
     # Resolve path with fallback and log *before* attempting to read.
     try:
-        media_path = _resolve_song_media_path(song.filename)
+        media_path = _resolve_song_media_path(song_filename)
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception(
             "stream_song_path_resolution_error: song_id=%s filename=%r media_root=%s cwd=%s exc=%s",
             str(song_id),
-            song.filename,
+            song_filename,
             str(media_root),
             os.getcwd(),
             exc.__class__.__name__,
@@ -409,9 +426,10 @@ def stream_song(song_id: uuid.UUID, request: Request):
         )
 
     logger.info(
-        "stream_song: song_id=%s filename=%s media_root=%s resolved_path=%s exists=%s is_file=%s cwd=%s range=%s",
+        "stream_song: song_id=%s filename=%s media_root=%s resolved_path=%s exists=%s "
+        "is_file=%s cwd=%s range=%s",
         str(song_id),
-        song.filename,
+        song_filename,
         str(media_root),
         str(media_path),
         media_path.exists(),
@@ -441,7 +459,7 @@ def stream_song(song_id: uuid.UUID, request: Request):
         )
         _json_404("File missing on server.")
 
-    disposition_name = f"{_sanitize_filename(song.title)}.mp3"
+    disposition_name = f"{_sanitize_filename(song_title)}.mp3"
     headers = {
         # Explicitly advertise range support (FileResponse also supports it).
         "Accept-Ranges": "bytes",
@@ -461,7 +479,10 @@ def stream_song(song_id: uuid.UUID, request: Request):
 @router.get(
     "/songs/{song_id}/stream/debug",
     summary="Debug stream resolution",
-    description="Returns resolved media path info for the given song id (no file bytes). Useful for live preview debugging.",
+    description=(
+        "Returns resolved media path info for the given song id (no file bytes). Useful for "
+        "live preview debugging."
+    ),
     operation_id="stream_song_debug",
     tags=["Songs"],
     responses={404: {"description": "Not found"}},
@@ -496,7 +517,8 @@ def stream_song_debug(song_id: uuid.UUID):
         raise
     except Exception as exc:
         logger.exception(
-            "stream_song_debug_path_resolution_error: song_id=%s filename=%r media_root=%s cwd=%s exc=%s",
+            "stream_song_debug_path_resolution_error: song_id=%s filename=%r media_root=%s cwd=%s "
+            "exc=%s",
             str(song_id),
             song.filename,
             str(media_root),

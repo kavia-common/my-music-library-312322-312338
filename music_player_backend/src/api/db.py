@@ -202,7 +202,10 @@ def db_session_dep() -> Generator[Session, None, None]:
             detail={
                 "error": "database_misconfigured",
                 "message": str(exc),
-                "hint": "Set DATABASE_URL or provide POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB (and optionally POSTGRES_PORT).",
+                "hint": (
+                    "Set DATABASE_URL or provide POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, "
+                    "POSTGRES_DB (and optionally POSTGRES_PORT)."
+                ),
             },
         )
     except SQLAlchemyError as exc:
@@ -212,6 +215,10 @@ def db_session_dep() -> Generator[Session, None, None]:
                 "error": "database_unavailable",
                 "message": "Database connection/query failed.",
                 "exception": exc.__class__.__name__,
-                "hint": "Ensure the database container is running and the backend can reach it using the configured env vars.",
+                "hint": (
+                    "Ensure the database container is running and the backend can reach it "
+                    "using the "
+                    "configured env vars."
+                ),
             },
         )
