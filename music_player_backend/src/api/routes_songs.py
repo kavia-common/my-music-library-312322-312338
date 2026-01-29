@@ -20,6 +20,7 @@ from typing import List, Optional, Tuple
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import desc, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.db import get_db_session
 from src.api.models import Song
@@ -92,19 +93,31 @@ def _validate_mp3(upload: UploadFile, content: bytes) -> Tuple[str, int]:
 )
 def list_songs() -> List[SongResponse]:
     """List all songs in the library (public)."""
-    with get_db_session() as db:
-        songs = db.execute(select(Song).order_by(desc(Song.created_at))).scalars().all()
-        return [
-            SongResponse(
-                id=s.id,
-                title=s.title,
-                artist=s.artist,
-                created_at=s.created_at,
-                size_bytes=int(s.size_bytes),
-                content_type=s.content_type,
-            )
-            for s in songs
-        ]
+    try:
+        with get_db_session() as db:
+            songs = db.execute(select(Song).order_by(desc(Song.created_at))).scalars().all()
+            return [
+                SongResponse(
+                    id=s.id,
+                    title=s.title,
+                    artist=s.artist,
+                    created_at=s.created_at,
+                    size_bytes=int(s.size_bytes),
+                    content_type=s.content_type,
+                )
+                for s in songs
+            ]
+    except (RuntimeError, SQLAlchemyError) as exc:
+        # RuntimeError: missing DB configuration in src/api/db.py
+        # SQLAlchemyError: connection / query failures
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Backend database error while listing songs. "
+                "Verify DATABASE_URL or POSTGRES_* env vars are configured for the backend. "
+                f"({exc.__class__.__name__})"
+            ),
+        )
 
 
 @router.post(
@@ -143,19 +156,29 @@ def upload_song(
     now = datetime.now(timezone.utc)
     content_type = (file.content_type or "audio/mpeg").lower()
 
-    with get_db_session() as db:
-        song = Song(
-            id=song_id,
-            user_id=None,  # auth removed; songs are not user-scoped anymore
-            title=final_title,
-            artist=final_artist,
-            filename=stored_filename,
-            content_type=content_type,
-            size_bytes=size_bytes,
-            duration_seconds=None,
-            created_at=now,
+    try:
+        with get_db_session() as db:
+            song = Song(
+                id=song_id,
+                user_id=None,  # auth removed; songs are not user-scoped anymore
+                title=final_title,
+                artist=final_artist,
+                filename=stored_filename,
+                content_type=content_type,
+                size_bytes=size_bytes,
+                duration_seconds=None,
+                created_at=now,
+            )
+            db.add(song)
+    except (RuntimeError, SQLAlchemyError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Backend database error while saving uploaded song metadata. "
+                "Verify DATABASE_URL or POSTGRES_* env vars are configured for the backend. "
+                f"({exc.__class__.__name__})"
+            ),
         )
-        db.add(song)
 
     return SongUploadResponse(
         id=song_id,
@@ -181,10 +204,20 @@ def upload_song(
 )
 def stream_song(song_id: uuid.UUID):
     """Serve a song file by id (public)."""
-    with get_db_session() as db:
-        song = db.execute(select(Song).where(Song.id == song_id)).scalar_one_or_none()
-        if not song:
-            raise HTTPException(status_code=404, detail="Song not found.")
+    try:
+        with get_db_session() as db:
+            song = db.execute(select(Song).where(Song.id == song_id)).scalar_one_or_none()
+            if not song:
+                raise HTTPException(status_code=404, detail="Song not found.")
+    except (RuntimeError, SQLAlchemyError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Backend database error while loading song metadata. "
+                "Verify DATABASE_URL or POSTGRES_* env vars are configured for the backend. "
+                f"({exc.__class__.__name__})"
+            ),
+        )
 
     media_path = _media_root() / song.filename
     if not media_path.exists():
