@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from starlette.responses import FileResponse
 from starlette.status import HTTP_404_NOT_FOUND
 from sqlalchemy import desc, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -257,9 +257,10 @@ def stream_song(song_id: uuid.UUID):
 
     # FileResponse supports range requests in Starlette for efficient streaming.
     try:
+        # Serve as audio/mpeg for reliable browser playback in preview environments.
         return FileResponse(
             path=str(media_path),
-            media_type=song.content_type or "audio/mpeg",
+            media_type="audio/mpeg",
             filename=f"{song.title}.mp3",
         )
     except OSError:
