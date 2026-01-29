@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from starlette.status import HTTP_404_NOT_FOUND
 from sqlalchemy import desc, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -35,6 +36,44 @@ _MAX_FILE_BYTES_DEFAULT = 50 * 1024 * 1024  # 50MB
 def _media_root() -> Path:
     # Default to container-local media directory. Override via env if desired.
     return Path(os.getenv("MEDIA_ROOT", "media")).resolve()
+
+
+def _json_404(detail: str) -> None:
+    """Raise a JSON 404 error with a predictable shape."""
+    raise HTTPException(
+        status_code=HTTP_404_NOT_FOUND,
+        detail={"error": "not_found", "message": detail},
+    )
+
+
+def _resolve_song_media_path(song_filename: str) -> Path:
+    """
+    Resolve the on-disk path for a stored song filename.
+
+    Rules:
+    - If DB stored an absolute path, use it as-is.
+    - If DB stored a relative path (possibly with subdirs), resolve it under MEDIA_ROOT.
+    - Disallow path traversal outside MEDIA_ROOT for relative paths.
+    """
+    if not song_filename:
+        _json_404("File missing on server.")
+
+    raw = Path(song_filename)
+
+    # Absolute path: trust but still check existence later.
+    if raw.is_absolute():
+        return raw
+
+    media_root = _media_root()
+    # Normalize (removes .. etc) then ensure it is still under media_root.
+    candidate = (media_root / raw).resolve()
+    try:
+        candidate.relative_to(media_root)
+    except ValueError:
+        # Path traversal attempt or bad stored filename.
+        _json_404("File missing on server.")
+
+    return candidate
 
 
 def _max_file_bytes() -> int:
@@ -196,7 +235,10 @@ def stream_song(song_id: uuid.UUID):
         with get_db_session() as db:
             song = db.execute(select(Song).where(Song.id == song_id)).scalar_one_or_none()
             if not song:
-                raise HTTPException(status_code=404, detail="Song not found.")
+                _json_404("Song not found.")
+    except HTTPException:
+        # Preserve explicit HTTP errors (404 etc).
+        raise
     except (RuntimeError, SQLAlchemyError) as exc:
         raise HTTPException(
             status_code=500,
@@ -207,13 +249,19 @@ def stream_song(song_id: uuid.UUID):
             ),
         )
 
-    media_path = _media_root() / song.filename
-    if not media_path.exists():
-        raise HTTPException(status_code=404, detail="File missing on server.")
+    media_path = _resolve_song_media_path(song.filename)
+
+    # Use is_file() (not exists()) so we don't serve directories, and we return JSON 404 if missing.
+    if not media_path.is_file():
+        _json_404("File missing on server.")
 
     # FileResponse supports range requests in Starlette for efficient streaming.
-    return FileResponse(
-        path=str(media_path),
-        media_type=song.content_type or "audio/mpeg",
-        filename=f"{song.title}.mp3",
-    )
+    try:
+        return FileResponse(
+            path=str(media_path),
+            media_type=song.content_type or "audio/mpeg",
+            filename=f"{song.title}.mp3",
+        )
+    except OSError:
+        # If the path exists but cannot be opened/read, treat as missing from an API perspective.
+        _json_404("File missing on server.")
