@@ -17,12 +17,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import desc, select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
-from src.api.db import get_db_session
+from src.api.db import db_session_dep, get_db_session
 from src.api.models import Song
 from src.api.schemas import SongResponse, SongUploadResponse
 
@@ -91,33 +92,20 @@ def _validate_mp3(upload: UploadFile, content: bytes) -> Tuple[str, int]:
     description="Returns all songs in the library, newest first.",
     operation_id="list_songs",
 )
-def list_songs() -> List[SongResponse]:
+def list_songs(db: Session = Depends(db_session_dep)) -> List[SongResponse]:
     """List all songs in the library (public)."""
-    try:
-        with get_db_session() as db:
-            songs = db.execute(select(Song).order_by(desc(Song.created_at))).scalars().all()
-            return [
-                SongResponse(
-                    id=s.id,
-                    title=s.title,
-                    artist=s.artist,
-                    created_at=s.created_at,
-                    size_bytes=int(s.size_bytes),
-                    content_type=s.content_type,
-                )
-                for s in songs
-            ]
-    except (RuntimeError, SQLAlchemyError) as exc:
-        # RuntimeError: missing DB configuration in src/api/db.py
-        # SQLAlchemyError: connection / query failures
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Backend database error while listing songs. "
-                "Verify DATABASE_URL or POSTGRES_* env vars are configured for the backend. "
-                f"({exc.__class__.__name__})"
-            ),
+    songs = db.execute(select(Song).order_by(desc(Song.created_at))).scalars().all()
+    return [
+        SongResponse(
+            id=s.id,
+            title=s.title,
+            artist=s.artist,
+            created_at=s.created_at,
+            size_bytes=int(s.size_bytes),
+            content_type=s.content_type,
         )
+        for s in songs
+    ]
 
 
 @router.post(

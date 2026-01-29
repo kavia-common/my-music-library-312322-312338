@@ -12,6 +12,8 @@ from typing import Generator, Optional
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
+from fastapi import HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -42,10 +44,17 @@ def _build_database_url() -> str:
     db = os.getenv("POSTGRES_DB")
     port = os.getenv("POSTGRES_PORT")
 
-    if all([host, user, password, db, port]):
-        # Ensure URL doesn't include protocol.
-        host = host.replace("postgresql://", "").replace("postgres://", "")
-        return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+    if all([host, user, password, db]):
+        # Ensure host doesn't include protocol. Allow host to include an embedded port
+        # (e.g. "db:5432" or "localhost:5001") and do not double-append POSTGRES_PORT.
+        host = host.replace("postgresql://", "").replace("postgres://", "").strip()
+
+        # If host already contains ":<digits>" assume it includes a port.
+        if ":" in host and host.rsplit(":", 1)[-1].isdigit():
+            return f"postgresql+psycopg2://{user}:{password}@{host}/{db}"
+
+        if port:
+            return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
 
     raise RuntimeError(
         "Database configuration missing. Set DATABASE_URL or "
@@ -92,3 +101,37 @@ def get_db_session() -> Generator[Session, None, None]:
         raise
     finally:
         db.close()
+
+
+# PUBLIC_INTERFACE
+def db_session_dep() -> Generator[Session, None, None]:
+    """
+    FastAPI dependency that yields a DB session and returns clear JSON errors.
+
+    This is preferred over calling `get_db_session()` directly in route bodies because it:
+    - converts missing DB configuration into HTTP 503 with actionable details
+    - converts DB connection/query issues into HTTP 503 (instead of generic 500)
+    """
+    try:
+        with get_db_session() as db:
+            yield db
+    except RuntimeError as exc:
+        # Typically thrown by _build_database_url() for missing/invalid env configuration.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "database_misconfigured",
+                "message": str(exc),
+                "hint": "Set DATABASE_URL or provide POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB (and optionally POSTGRES_PORT).",
+            },
+        )
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "database_unavailable",
+                "message": "Database connection/query failed.",
+                "exception": exc.__class__.__name__,
+                "hint": "Ensure the database container is running and the backend can reach it using the configured env vars.",
+            },
+        )
