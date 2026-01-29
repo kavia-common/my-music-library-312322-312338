@@ -1,0 +1,211 @@
+"""
+Song endpoints:
+- POST /songs/upload (multipart mp3 upload)
+- GET /songs (list current user's songs)
+- GET /songs/{id}/stream (secure streaming for current user only)
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from sqlalchemy import select, desc
+
+from src.api.auth import get_current_user
+from src.api.db import get_db_session
+from src.api.models import Song, User
+from src.api.schemas import SongResponse, SongUploadResponse
+
+router = APIRouter(tags=["Songs"])
+
+_MAX_FILE_BYTES_DEFAULT = 50 * 1024 * 1024  # 50MB
+
+
+def _media_root() -> Path:
+    # Default to container-local media directory. Override via env if desired.
+    return Path(os.getenv("MEDIA_ROOT", "media")).resolve()
+
+
+def _max_file_bytes() -> int:
+    try:
+        return int(os.getenv("MAX_UPLOAD_BYTES", str(_MAX_FILE_BYTES_DEFAULT)))
+    except ValueError:
+        return _MAX_FILE_BYTES_DEFAULT
+
+
+def _sanitize_filename(name: str) -> str:
+    # Keep it simple and safe: letters, numbers, dot, dash, underscore.
+    name = name.strip().replace("\\", "_").replace("/", "_")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    return name or "upload.mp3"
+
+
+def _validate_mp3(upload: UploadFile, content: bytes) -> Tuple[str, int]:
+    """
+    Basic mp3 validation.
+
+    We accept:
+    - Content-Type includes audio/mpeg OR application/octet-stream (some browsers)
+    - Extension .mp3
+    - Optional magic for ID3 header ("ID3") or MPEG frame sync (0xFFEx)
+    """
+    filename = upload.filename or "upload.mp3"
+    safe_name = _sanitize_filename(filename)
+
+    if not safe_name.lower().endswith(".mp3"):
+        raise HTTPException(status_code=400, detail="Only .mp3 files are supported.")
+
+    content_type = (upload.content_type or "").lower()
+    if content_type and ("audio/mpeg" not in content_type) and ("application/octet-stream" not in content_type):
+        raise HTTPException(status_code=400, detail="Invalid content type; expected audio/mpeg.")
+
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(content) > _max_file_bytes():
+        raise HTTPException(status_code=413, detail="File too large.")
+
+    head = content[:10]
+    is_id3 = head.startswith(b"ID3")
+    is_mpeg = len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0
+    if not (is_id3 or is_mpeg):
+        # Basic check only; don't be overly strict.
+        raise HTTPException(status_code=400, detail="File does not look like a valid mp3.")
+
+    return safe_name, len(content)
+
+
+@router.get(
+    "/songs",
+    response_model=List[SongResponse],
+    summary="List current user's songs",
+    description="Returns songs for the authenticated user, newest first.",
+    operation_id="list_songs",
+)
+def list_songs(current_user: User = Depends(get_current_user)) -> List[SongResponse]:
+    """List songs belonging to the current user."""
+    with get_db_session() as db:
+        songs = (
+            db.execute(
+                select(Song)
+                .where(Song.user_id == current_user.id)
+                .order_by(desc(Song.created_at))
+            )
+            .scalars()
+            .all()
+        )
+        return [
+            SongResponse(
+                id=s.id,
+                title=s.title,
+                artist=s.artist,
+                created_at=s.created_at,
+                size_bytes=int(s.size_bytes),
+                content_type=s.content_type,
+            )
+            for s in songs
+        ]
+
+
+@router.post(
+    "/songs/upload",
+    response_model=SongUploadResponse,
+    summary="Upload an mp3",
+    description="Uploads an mp3 file for the authenticated user. Stores file on disk and metadata in DB.",
+    operation_id="upload_song",
+)
+def upload_song(
+    file: UploadFile = File(..., description="MP3 file upload (multipart/form-data)"),
+    title: Optional[str] = Form(None, description="Optional title. Defaults to original filename stem."),
+    artist: Optional[str] = Form(None, description="Optional artist. Defaults to 'Unknown Artist'."),
+    current_user: User = Depends(get_current_user),
+) -> SongUploadResponse:
+    """Upload an mp3 for the current user with basic validation and metadata."""
+    content = file.file.read()
+    safe_name, size_bytes = _validate_mp3(file, content)
+
+    # Fill defaults
+    final_title = (title or Path(safe_name).stem).strip() or "Untitled"
+    final_artist = (artist or "Unknown Artist").strip() or "Unknown Artist"
+
+    # Store to disk
+    media_root = _media_root()
+    media_root.mkdir(parents=True, exist_ok=True)
+
+    song_id = uuid.uuid4()
+    stored_filename = f"{song_id}_{safe_name}"
+    stored_path = media_root / stored_filename
+
+    try:
+        stored_path.write_bytes(content)
+    except OSError:
+        raise HTTPException(status_code=500, detail="Failed to store file.")
+
+    now = datetime.now(timezone.utc)
+    content_type = (file.content_type or "audio/mpeg").lower()
+
+    with get_db_session() as db:
+        song = Song(
+            id=song_id,
+            user_id=current_user.id,
+            title=final_title,
+            artist=final_artist,
+            filename=stored_filename,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            duration_seconds=None,
+            created_at=now,
+        )
+        db.add(song)
+
+    return SongUploadResponse(
+        id=song_id,
+        title=final_title,
+        artist=final_artist,
+        filename=stored_filename,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        duration_seconds=None,
+        created_at=now,
+    )
+
+
+@router.get(
+    "/songs/{song_id}/stream",
+    summary="Stream a song (secure)",
+    description="Streams the mp3 file for the authenticated user if they own it.",
+    operation_id="stream_song",
+    responses={
+        200: {"content": {"audio/mpeg": {}}},
+        401: {"description": "Unauthorized"},
+        404: {"description": "Not found"},
+    },
+)
+def stream_song(song_id: uuid.UUID, current_user: User = Depends(get_current_user)):
+    """Securely serve a song file only if it belongs to the current user."""
+    with get_db_session() as db:
+        song = (
+            db.execute(
+                select(Song).where(Song.id == song_id, Song.user_id == current_user.id)
+            )
+            .scalar_one_or_none()
+        )
+        if not song:
+            raise HTTPException(status_code=404, detail="Song not found.")
+
+    media_path = _media_root() / song.filename
+    if not media_path.exists():
+        raise HTTPException(status_code=404, detail="File missing on server.")
+
+    # FileResponse supports range requests in Starlette for efficient streaming.
+    return FileResponse(
+        path=str(media_path),
+        media_type=song.content_type or "audio/mpeg",
+        filename=f"{song.title}.mp3",
+    )
